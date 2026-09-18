@@ -1,0 +1,124 @@
+name: Sync upstream
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Once a day, away from the top of the hour to reduce schedule delays.
+    - cron: "17 3 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_REPO: https://github.com/Jgaram/nikke-calc.git
+      UPSTREAM_BRANCH: master
+      BASE_BRANCH: master
+      SYNC_BRANCH: automation/upstream-sync
+
+    steps:
+      - name: Check out the fork
+        uses: actions/checkout@v4
+        with:
+          ref: master
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Fetch upstream and fork branches
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+          git fetch origin "$BASE_BRANCH"
+          git fetch origin "$SYNC_BRANCH" || true
+
+      - name: Build the upstream sync branch
+        id: sync
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          base_ref="origin/$BASE_BRANCH"
+          upstream_ref="upstream/$UPSTREAM_BRANCH"
+          base_sha="$(git rev-parse "$base_ref")"
+          upstream_sha="$(git rev-parse "$upstream_ref")"
+
+          echo "base_sha=$base_sha" >> "$GITHUB_OUTPUT"
+          echo "upstream_sha=$upstream_sha" >> "$GITHUB_OUTPUT"
+
+          if git merge-base --is-ancestor "$upstream_ref" "$base_ref"; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::The fork is already up to date with $UPSTREAM_REPO@$UPSTREAM_BRANCH."
+            exit 0
+          fi
+
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          git switch --create "$SYNC_BRANCH" "$base_ref"
+          git merge --no-edit "$upstream_ref"
+          echo "sync_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Push the sync branch
+        if: steps.sync.outputs.updated == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          remote_branch_ref="refs/remotes/origin/$SYNC_BRANCH"
+          if git show-ref --verify --quiet "$remote_branch_ref"; then
+            expected_sha="$(git rev-parse "$remote_branch_ref")"
+            git push origin "HEAD:refs/heads/$SYNC_BRANCH" \
+              "--force-with-lease=refs/heads/$SYNC_BRANCH:$expected_sha"
+          else
+            git push origin "HEAD:refs/heads/$SYNC_BRANCH"
+          fi
+
+      - name: Create or update the sync pull request
+        if: steps.sync.outputs.updated == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          pr_body="$(cat <<EOF
+          This PR was created automatically to sync the fork with the upstream repository.
+
+          - Upstream: $UPSTREAM_REPO@$UPSTREAM_BRANCH
+          - Upstream commit: \`${{ steps.sync.outputs.upstream_sha }}\`
+          - Fork base commit: \`${{ steps.sync.outputs.base_sha }}\`
+
+          Review this PR before merging. A merge conflict means the fork has changes that
+          need to be reconciled with upstream manually.
+          EOF
+          )"
+
+          existing_pr="$(gh pr list \
+            --repo "$GITHUB_REPOSITORY" \
+            --state open \
+            --base "$BASE_BRANCH" \
+            --json number,headRefName \
+            --jq ".[] | select(.headRefName == \"$SYNC_BRANCH\") | .number" \
+            | head -n 1)"
+
+          if [[ -n "$existing_pr" ]]; then
+            gh pr edit "$existing_pr" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "chore: sync with Jgaram/nikke-calc" \
+              --body "$pr_body"
+          else
+            gh pr create \
+              --repo "$GITHUB_REPOSITORY" \
+              --base "$BASE_BRANCH" \
+              --head "$GITHUB_REPOSITORY_OWNER:$SYNC_BRANCH" \
+              --title "chore: sync with Jgaram/nikke-calc" \
+              --body "$pr_body"
+          fi

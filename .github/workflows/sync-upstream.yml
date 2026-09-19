@@ -31,6 +31,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
+      - name: Configure git identity for the sync merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
       - name: Fetch upstream and fork branches
         shell: bash
         run: |
@@ -63,7 +70,7 @@ jobs:
 
           echo "updated=true" >> "$GITHUB_OUTPUT"
           git switch --create "$SYNC_BRANCH" "$base_ref"
-          git merge --no-edit "$upstream_ref"
+          git merge --allow-unrelated-histories --no-edit "$upstream_ref"
           echo "sync_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Push the sync branch
